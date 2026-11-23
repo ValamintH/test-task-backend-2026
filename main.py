@@ -1,23 +1,37 @@
 import logging
 from typing import Iterator, List, Dict
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete
 from sqlalchemy.orm.attributes import flag_modified
 
-from abstract_customer import get_abccustomer_by_lead_login, create_or_update_customer, \
-    get_abccustomer_by_amocustomer_login, dict_compare_merge, create_or_update_lead
+from abstract_customer import create_or_update_customer, dict_compare_merge, create_or_update_lead
 from amocrm import Customer, COMPANIES, CONTACTS, Lead, amocrm_get
+from customer_index import CustomerIndex
 from models import db, AbstractCustomer
 
 logger = logging.getLogger(__name__)
 
+BATCH_SIZE = 2000
 
-def lead_action(lead: Lead):
-    abstract_customer = db.session.query(AbstractCustomer).filter(
-        AbstractCustomer.amo_leads.op('@>')([{'general': {'id': lead.id}}])).first()
+
+def _maybe_commit(counter: int, batch_size: int = BATCH_SIZE) -> int:
+    """Коммитит, если счётчик достиг размера батча. Возвращает новый счётчик"""
+    if counter >= batch_size:
+        try:
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            raise
+        return 0
+    return counter
+
+
+def lead_action(lead: Lead, index: CustomerIndex):
+    abstract_customer = index.get_by_lead_id(lead.id)
+
     lead_login = lead.get_field('Логин')
     if lead_login:
-        abs_customer_login = get_abccustomer_by_amocustomer_login(lead_login)
+        abs_customer_login = index.get_by_customer_login(lead_login)
         if abstract_customer is None:
             abstract_customer = abs_customer_login
         if abs_customer_login is not None:
@@ -34,13 +48,16 @@ def lead_action(lead: Lead):
                 flag_modified(abstract_customer, "amo_leads")
                 flag_modified(abstract_customer, "amo_contacts")
                 flag_modified(abstract_customer, "amo_companies")
-                db.session.commit()
                 db.session.flush()
                 db.session.delete(abs_customer_login)
-                db.session.commit()
-                return
+                db.session.flush()
+                index.remove(abs_customer_login)
+                index.reindex(abstract_customer)
+                return abstract_customer
 
-    return create_or_update_lead(abstract_customer, lead)
+    result = create_or_update_lead(abstract_customer, lead)
+    index.reindex(result)
+    return result
 
 
 def collect_leads_customers(is_full=True):
@@ -60,23 +77,26 @@ def collect_leads_customers(is_full=True):
         companies: [...]
     }
     """
-    session = db.session
+    # Один запрос для всего
+    index = CustomerIndex.load()
+
     customers: Iterator[Customer] = amocrm_get(Customer, _with=f"{COMPANIES},{CONTACTS}")
     logger.info(f"Collected customers {is_full=}")
 
     ids_map = {}
+    batch_counter = 0
     for customer in customers:
         if is_full is False and customer.status_id == 111349:
             continue
         customer_login = customer.get_field('Логин')
         if not customer_login:
             continue
-        abstract_customer = session.query(AbstractCustomer).filter(
-            AbstractCustomer.amo_customers.op('@>')([{'general': {'id': customer.id}}])).first()
+        abstract_customer = index.get_by_customer_id(customer.id)
 
         if not abstract_customer:
-            abstract_customer = get_abccustomer_by_lead_login(customer_login)  # почти всегда логины совпадают
+            abstract_customer = index.get_by_lead_login(customer_login)  # почти всегда логины совпадают
         abstract_customer = create_or_update_customer(abstract_customer, customer)
+        index.reindex(abstract_customer)
         if is_full is True:
             if abstract_customer.id in ids_map:
                 ids_map[abstract_customer.id]["customers"].append(customer.id)
@@ -89,16 +109,26 @@ def collect_leads_customers(is_full=True):
                     "companies": [c["id"] for c in customer.companies],
                     "leads": [],
                 }
+        batch_counter += 1
+        batch_counter = _maybe_commit(batch_counter)
+
+    # финальный коммит батча customers
+    try:
         db.session.commit()
+    except Exception:
+        db.session.rollback()
+        raise
 
     del customers
     amo_leads: Iterator[Lead] = amocrm_get(Lead, _with=f"{CONTACTS}")
     logger.info(f"Collected leads {is_full=}")
+
+    batch_counter = 0
     for amo_lead in amo_leads:
         if is_full is False and amo_lead.status_id == 143:
             continue
         try:
-            abc_customer = lead_action(amo_lead)
+            abc_customer = lead_action(amo_lead, index)
             if is_full is True:
                 if abc_customer.id in ids_map:
                     ids_map[abc_customer.id]["leads"].append(amo_lead.id)
@@ -111,7 +141,19 @@ def collect_leads_customers(is_full=True):
                         "leads": [amo_lead.id],
                     }
         except Exception as e:
+            db.session.rollback()
             logger.exception(f'{amo_lead} {e}')
+            batch_counter = 0
+            continue
+        batch_counter += 1
+        batch_counter = _maybe_commit(batch_counter)
+
+    # финальный коммит батча leads
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        raise
 
     if is_full is False:
         return
@@ -123,21 +165,36 @@ def collect_leads_customers(is_full=True):
         db.session.execute(stmt)
         db.session.commit()
         logger.info("Чистка покупателей на уровне сущностей")
-        for abc_customer in db.session.scalars(select(AbstractCustomer)).all():
-            filter_abc_customer(abc_customer=abc_customer, ids_map=ids_map)
+
+        batch_counter = 0
+        for abc_customer in list(index.all):
+            if abc_customer.id not in ids_map:
+                continue
+            try:
+                filter_abc_customer(abc_customer=abc_customer, ids_map=ids_map)
+            except Exception as e:
+                db.session.rollback()
+                logger.exception(e)
+                batch_counter = 0
+                continue
+            batch_counter += 1
+            batch_counter = _maybe_commit(batch_counter)
+        # финальный коммит батча чистки
+        db.session.commit()
     except Exception as e:
+        db.session.rollback()
         logger.exception(f"Чистка: {e}")
 
 
 def filter_merge_abstract_customer(abc_customer: AbstractCustomer, attr: str,
                                    check_ids: List[int]):
     entity = abc_customer.__getattribute__(attr)
-    for l in entity:
-        entity = [c for c in entity if
-                  'удалить' not in l['general'].get('name').lower() and l['general'].get('id') in check_ids]
-        setattr(abc_customer, attr, entity)
+    new_entity = [c for c in entity if
+                  'удалить' not in c['general'].get('name').lower() and c['general'].get('id') in check_ids]
+    if new_entity != entity:
+        setattr(abc_customer, attr, new_entity)
         flag_modified(abc_customer, attr)
-        db.session.commit()
+        db.session.flush()
 
 
 def filter_abc_customer(abc_customer: AbstractCustomer, ids_map: Dict):
@@ -172,4 +229,4 @@ def filter_abc_customer(abc_customer: AbstractCustomer, ids_map: Dict):
     if not abc_customer.amo_leads and not abc_customer.amo_customers:
         db.session.flush()
         db.session.delete(abc_customer)
-    db.session.commit()
+        db.session.flush()

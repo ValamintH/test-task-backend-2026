@@ -3,6 +3,9 @@ import logging
 from collections import defaultdict
 from typing import Optional, Dict
 
+from sqlalchemy.orm.attributes import flag_modified
+
+from customer_index import CustomerIndex
 from sqlalchemy import text
 
 from amocrm import Customer, Lead
@@ -67,30 +70,12 @@ def get_lead_json(lead: Lead) -> dict:
     }
 
 
-def get_abccustomer_by_lead_login(lead_login: str) -> Optional[AbstractCustomer]:
-    customers = db.session.query(AbstractCustomer).filter(
-        AbstractCustomer.amo_leads.op('@>')([{'general': {'login': lead_login}}])).all()
-
-    if len(customers) > 1:
-        logger.warning(f"Lead {lead_login} has more than one abccustomer")
-        return None
-    if not customers:
-        return None
-
-    return customers[0]
+def get_abccustomer_by_lead_login(lead_login: str, index: CustomerIndex) -> Optional[AbstractCustomer]:
+    return index.get_by_lead_login(lead_login)
 
 
-def get_abccustomer_by_amocustomer_login(customer_login: str) -> Optional[AbstractCustomer]:
-    customers = db.session.query(AbstractCustomer).filter(
-        AbstractCustomer.amo_customers.op('@>')([{'general': {'login': customer_login}}])).all()
-
-    if len(customers) > 1:
-        logger.warning(f"Customer {customer_login} has more than one abccustomer")
-        return None
-    if not customers:
-        return None
-
-    return customers[0]
+def get_abccustomer_by_amocustomer_login(customer_login: str, index: CustomerIndex) -> Optional[AbstractCustomer]:
+    return index.get_by_customer_login(customer_login)
 
 
 def create_or_update_customer(abstract_customer: Optional[AbstractCustomer], amo_customer: Customer):
@@ -125,12 +110,13 @@ def create_or_update_lead(abc_customer: Optional[AbstractCustomer], amo_lead: Le
         new_abstract_customer = AbstractCustomer(
             amo_leads=[get_lead_json(amo_lead)])
         db.session.add(new_abstract_customer)
-        db.session.commit()
+        db.session.flush()          # получить id без commit
         return new_abstract_customer
 
     if not abc_customer.amo_leads:
         abc_customer.amo_leads = [get_lead_json(amo_lead)]
-        db.session.commit()
+        flag_modified(abc_customer, "amo_leads")
+        db.session.flush()
         return abc_customer
 
     index = [idx for idx, c in enumerate(abc_customer.amo_leads) if c['general']['id'] == amo_lead.id]
@@ -143,5 +129,5 @@ def create_or_update_lead(abc_customer: Optional[AbstractCustomer], amo_lead: Le
                        attribute=AbcCustomerEntities.AmoLead,
                        index=index,
                        new_value=get_lead_json(amo_lead))
-    db.session.commit()
+    db.session.flush()
     return abc_customer
